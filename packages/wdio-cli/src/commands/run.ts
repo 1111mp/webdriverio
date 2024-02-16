@@ -195,6 +195,50 @@ function nodeVersion(type: keyof typeof NodeVersion): number {
     return process.versions.node.split('.').map(Number)[NodeVersion[type]]
 }
 
+async function loadConfigData(
+    filePath: string,
+    isTSFile: boolean = false
+): Promise<{ config: Partial<RunCommandArguments> }> {
+    try {
+        await fs.access(filePath, fs.constants.R_OK | fs.constants.W_OK)
+    } catch {
+        return { config: {} }
+    }
+
+    const isESM = filePath.endsWith('.mjs') || filePath.endsWith('.mts')
+
+    if (filePath.endsWith('.mts')) {
+        const { compile } = (await import('ts-node')).register({
+            compilerOptions: {
+                module: 'ESNext',
+                moduleResolution: 'node',
+            },
+            esm: true,
+        })
+        const code = compile(
+            await fs.readFile(filePath, { encoding: 'utf8' }),
+            filePath
+        )
+        const fileNameTmp = path.resolve(
+            process.cwd(),
+            `wdio.config.${Date.now()}.mjs`
+        )
+        try {
+            await fs.writeFile(fileNameTmp, code)
+            const data = await import(fileNameTmp)
+            return data.default ? data.default : data
+        } finally {
+            await fs.unlink(fileNameTmp)
+        }
+    }
+
+    isTSFile && (await import('ts-node')).register()
+    const { createRequire } = await import('node:module').then(module => module.default)
+    const require = createRequire(import.meta.url)
+    const data = isESM ? await import(filePath) : require(filePath)
+    return data.default ? data.default : data
+}
+
 export async function handler(argv: RunCommandArguments) {
     const { configPath = 'wdio.conf.js', ...params } = argv
 
@@ -214,7 +258,7 @@ export async function handler(argv: RunCommandArguments) {
      */
     const nodePath = process.argv[0]
     let NODE_OPTIONS = process.env.NODE_OPTIONS || ''
-    const isTSFile = wdioConf.fullPath.endsWith('.ts') || wdioConf.fullPath.endsWith('.mts')
+    const isTSFile = wdioConf.fullPath.endsWith('.ts')|| wdioConf.fullPath.endsWith('.cts') || wdioConf.fullPath.endsWith('.mts')
     const runsWithLoader = (
         Boolean(
             process.argv.find((arg) => arg.startsWith('--loader')) &&
@@ -222,6 +266,8 @@ export async function handler(argv: RunCommandArguments) {
         ) ||
         NODE_OPTIONS?.includes('ts-node/esm')
     )
+    const { config } = await loadConfigData(wdioConf.fullPath, isTSFile)
+    const wdioConfig = { ...params, ...config }
     if (isTSFile && !runsWithLoader && nodePath) {
         NODE_OPTIONS += ' --loader ts-node/esm/transpile-only --no-warnings'
         if (nodeVersion('major') >= 20 || (nodeVersion('major') === 18 && nodeVersion('minor') >= 19)) {
@@ -232,8 +278,8 @@ export async function handler(argv: RunCommandArguments) {
         }
         const tsNodeProjectFromEnvVar = process.env.TS_NODE_PROJECT &&
             path.resolve(process.cwd(), process.env.TS_NODE_PROJECT)
-        const tsNodeProjectFromParams = params.autoCompileOpts?.tsNodeOpts?.project &&
-            path.resolve(process.cwd(), params.autoCompileOpts?.tsNodeOpts?.project)
+        const tsNodeProjectFromParams = wdioConfig.autoCompileOpts?.tsNodeOpts?.project &&
+            path.resolve(process.cwd(), wdioConfig.autoCompileOpts?.tsNodeOpts?.project)
         const tsNodeProjectRelativeToWdioConfig = path.join(path.dirname(wdioConf.fullPath), 'tsconfig.json')
         if (tsNodeProjectFromParams) {
             console.log('Deprecated: use the TS_NODE_PROJECT environment variable instead')
@@ -259,8 +305,8 @@ export async function handler(argv: RunCommandArguments) {
     /**
      * if `--watch` param is set, run launcher in watch mode
      */
-    if (params.watch) {
-        const watcher = new Watcher(wdioConf.fullPath, params)
+    if (wdioConfig.watch) {
+        const watcher = new Watcher(wdioConf.fullPath, wdioConfig)
         return watcher.watch()
     }
 
@@ -272,12 +318,12 @@ export async function handler(argv: RunCommandArguments) {
      * stdin.isTTY is false when command is from nodes spawn since it's treated as a pipe
      */
     if (process.stdin.isTTY || !process.stdout.isTTY) {
-        return launch(wdioConf.fullPath, params)
+        return launch(wdioConf.fullPath, wdioConfig)
     }
 
     /*
      * get a list of spec files to run from stdin, overriding any other
      * configuration suite or specs.
      */
-    launchWithStdin(wdioConf.fullPath, params)
+    launchWithStdin(wdioConf.fullPath, wdioConfig)
 }
